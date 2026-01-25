@@ -235,21 +235,25 @@ Addresses project goals:
 ## Files Structure
 
 ```
-dino-visual-memory/
-├── requirements.txt          # Dependencies
-├── embeddings.py             # DINO embedding extractor
-├── memory.py                 # Visual memory system
-├── segmentation.py           # SAM integration
-├── segment_and_embed.py      # Full pipeline
-├── main.py                   # Main execution script
-├── data/
-│   ├── apartment/           # Your photos here
-│   └── other_location/      # Optional cross-env data
-├── results/
-│   ├── clusters.png         # t-SNE visualization
-│   └── apartment_memory.pkl # Saved memory state
-└── checkpoints/
-    └── sam2.1_hiera_large.pt # SAM 2 weights
+dino-steering/
+├── project_overview.md           # This file - project documentation
+├── README.md                     # Repository readme
+├── requirements.txt              # Dependencies
+├── demo_extraction.py            # Demo script for extraction
+├── Colab_Steering_Dino_V2.ipynb  # Colab notebook for steering
+├── Steering_Dino_V2.ipynb        # Local notebook for steering
+├── src/
+│   ├── embeddings.py             # DINO embedding extractor
+│   ├── memory.py                 # Visual memory system
+│   ├── segmentation.py           # SAM integration
+│   └── main.py                   # Main execution script
+└── images/
+    ├── habitat/                  # Habitat simulator images
+    │   └── *.png                 # Object images (coke_can, toothbrush, etc.)
+    ├── isaac/                    # Isaac Sim images
+    │   └── *.png                 # Object images (compass, grill, etc.)
+    └── real/                     # Real-world images
+        └── *.png                 # Real photos (coke, etc.)
 ```
 
 ---
