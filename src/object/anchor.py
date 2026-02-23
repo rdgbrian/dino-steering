@@ -1,4 +1,5 @@
 # anchor.py
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Union
 import json
@@ -93,7 +94,128 @@ class AnchorConfig:
         return transform_objects
 
 
-class SymbolicAnchor:
+class Anchor(ABC):
+    """
+    Abstract base class for all anchor types.
+
+    Subclasses represent an object as some structure in DINO embedding space
+    and expose a unified matching API.
+    """
+
+    @abstractmethod
+    def extract_from_images(self, images: List[Union[Image.Image, str]]) -> 'Anchor':
+        """Fit the anchor from a list of images. Returns self."""
+        ...
+
+    @abstractmethod
+    def cosine_to_anchor(self, embedding: np.ndarray) -> float:
+        """
+        Cosine similarity between a raw embedding and this anchor.
+
+        Returns:
+            float in [0, 1] — higher means better match
+        """
+        ...
+
+    @abstractmethod
+    def match_image(self, image: Union[Image.Image, str]) -> float:
+        """
+        Embed an image and return its cosine similarity to this anchor.
+
+        Returns:
+            float in [0, 1] — higher means better match
+        """
+        ...
+
+
+class SimpleAnchor(Anchor):
+    """
+    Simple anchor: the mean DINO embedding of the training images.
+
+    Matching is standard cosine similarity between the query embedding
+    and the stored anchor embedding.
+    """
+
+    def __init__(self, dino_model: str = 'dinov2_vitl14', device: str = 'cuda'):
+        self._dino_model = dino_model
+        self.embedder = DINOEmbedder(model_name=dino_model, device=device)
+        self.anchor_embedding: np.ndarray | None = None  # (d,)
+
+    def extract_from_images(self, images: List[Union[Image.Image, str]]) -> 'SimpleAnchor':
+        """
+        Compute anchor as the mean embedding of all training images.
+
+        Args:
+            images: List of PIL Images or image paths
+        """
+        pil_images = []
+        for img in images:
+            if isinstance(img, str):
+                pil_images.append(Image.open(img).convert('RGB'))
+            else:
+                pil_images.append(img)
+
+        print(f"Embedding {len(pil_images)} images...")
+        embeddings = self.embedder.embed_batch(pil_images)  # (n, d)
+        self.anchor_embedding = embeddings.mean(axis=0)     # (d,)
+
+        print(f"SimpleAnchor extracted: mean of {len(pil_images)} embeddings, dim={self.anchor_embedding.shape[0]}")
+        return self
+
+    def cosine_to_anchor(self, embedding: np.ndarray) -> float:
+        """
+        Standard cosine similarity between embedding and anchor embedding.
+
+        Args:
+            embedding: (d,) array
+
+        Returns:
+            float in [0, 1]
+        """
+        if self.anchor_embedding is None:
+            raise ValueError("Anchor not yet extracted. Call extract_from_images first.")
+
+        norm_emb = np.linalg.norm(embedding)
+        norm_anc = np.linalg.norm(self.anchor_embedding)
+        if norm_emb == 0 or norm_anc == 0:
+            return 0.0
+        return float(np.dot(embedding, self.anchor_embedding) / (norm_emb * norm_anc))
+
+    def match_image(self, image: Union[Image.Image, str]) -> float:
+        """
+        Cosine similarity between image and anchor embedding.
+
+        Returns:
+            float in [0, 1] — higher = better match
+        """
+        if isinstance(image, str):
+            image = Image.open(image).convert('RGB')
+        embedding = self.embedder.embed_single(image)
+        return self.cosine_to_anchor(embedding)
+
+    def save(self, path: str):
+        """Save anchor to file"""
+        data = {
+            'dino_model': self._dino_model,
+            'device': self.embedder.device,
+            'anchor_embedding': self.anchor_embedding,
+        }
+        with open(path, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"SimpleAnchor saved to {path}")
+
+    @classmethod
+    def load(cls, path: str) -> 'SimpleAnchor':
+        """Load anchor from file"""
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        anchor = cls(dino_model=data['dino_model'], device=data['device'])
+        anchor.anchor_embedding = data['anchor_embedding']
+        print(f"SimpleAnchor loaded from {path} (dim={anchor.anchor_embedding.shape[0]})")
+        return anchor
+
+
+class SymbolicAnchor(Anchor):
     """
     Symbolic anchor: a subspace in embedding space representing an object
     """
@@ -110,10 +232,13 @@ class SymbolicAnchor:
         )
         
         # Anchor components (set after extraction)
-        self.anchor_basis = None  # (d, r) array - top r eigenvectors
-        self.eigenvalues = None   # (r,) array - corresponding eigenvalues
+        self.anchor_basis = None  # (d, d) array - all eigenvectors
+        self.eigenvalues = None   # (d,) array - all eigenvalues (descending)
         self.mean_embedding = None  # (d,) array - mean of training embeddings
-        
+
+        # Settable r — how many eigenvectors to use at projection time
+        self._anchor_dim: int = config.anchor_dim
+
         # Metadata
         self.n_samples = 0
         self.embedding_dim = None
@@ -141,12 +266,12 @@ class SymbolicAnchor:
         embeddings = self.embedder.embed_batch(augmented_images)
         
         # Extract anchor via V^T V eigendecomposition
-        anchor = self._compute_anchor(embeddings)
-        
+        self._compute_anchor(embeddings)
+
         print(f"Anchor extracted: {self.anchor_dim}D subspace in {self.embedding_dim}D space")
         print(f"Top {self.anchor_dim} eigenvalues explain {self.explained_variance_ratio():.2%} of variance")
 
-        return anchor
+        return self
     
     def _augment_images(self, images: List[Image.Image]) -> List[Image.Image]:
         """
@@ -171,37 +296,34 @@ class SymbolicAnchor:
     
     def _compute_anchor(self, embeddings: np.ndarray):
         """
-        Compute anchor via V^T V eigendecomposition
-        
+        Compute anchor via V^T V eigendecomposition.
+        Always stores the full decomposition; use anchor_dim to control
+        how many eigenvectors are used at projection time.
+
         Args:
             embeddings: (n, d) array of DINO embeddings
         """
         V = embeddings  # (n, d)
         self.n_samples = V.shape[0]
         self.embedding_dim = V.shape[1]
-        
+
         # Center embeddings
         self.mean_embedding = V.mean(axis=0)
         V_centered = V - self.mean_embedding
-        
+
         # Compute covariance matrix V^T V
         VTV = V_centered.T @ V_centered / (self.n_samples - 1)  # (d, d)
-        
-        # Eigendecomposition
+
+        # Full eigendecomposition
         eigenvalues, eigenvectors = np.linalg.eigh(VTV)
-        
+
         # Sort by eigenvalue (descending)
         idx = eigenvalues.argsort()[::-1]
-        eigenvalues = eigenvalues[idx]
-        eigenvectors = eigenvectors[:, idx]
-        
-        # Keep top r eigenvectors
-        r = self.config.anchor_dim
-        self.anchor_basis = eigenvectors[:, :r]  # (d, r)
-        self.eigenvalues = eigenvalues[:r]       # (r,)
-        
+        self.eigenvalues = eigenvalues[idx]   # (d,)
+        self.anchor_basis = eigenvectors[:, idx]  # (d, d)
+
         # Print eigenvalue distribution
-        print(f"Top 5 eigenvalues: {eigenvalues[:5]}")
+        print(f"Top 5 eigenvalues: {self.eigenvalues[:5]}")
     
     def project(self, embedding: np.ndarray) -> np.ndarray:
         """
@@ -218,10 +340,11 @@ class SymbolicAnchor:
         
         # Center
         emb_centered = embedding - self.mean_embedding
-        
-        # Project onto subspace
-        projection = self.anchor_basis @ (self.anchor_basis.T @ emb_centered)
-        
+
+        # Project onto top-r subspace
+        basis = self.anchor_basis[:, :self.anchor_dim]  # (d, r)
+        projection = basis @ (basis.T @ emb_centered)
+
         return projection + self.mean_embedding
     
     def distance_to_subspace(self, embedding: np.ndarray) -> float:
@@ -237,41 +360,71 @@ class SymbolicAnchor:
         projection = self.project(embedding)
         return np.linalg.norm(embedding - projection)
     
+    def cosine_to_anchor(self, embedding: np.ndarray) -> float:
+        """
+        Cosine of the angle between the embedding and the anchor subspace.
+
+        Args:
+            embedding: (d,) array
+
+        Returns:
+            float in [0, 1] — 1 means the embedding lies in the subspace, 0 means orthogonal
+        """
+        if self.anchor_basis is None:
+            raise ValueError("Anchor not yet extracted. Call extract_from_images first.")
+
+        emb_centered = embedding - self.mean_embedding
+        norm_emb = np.linalg.norm(emb_centered)
+        if norm_emb == 0:
+            return 0.0
+
+        basis = self.anchor_basis[:, :self.anchor_dim]  # (d, r)
+        proj_coords = basis.T @ emb_centered             # (r,)
+        return np.linalg.norm(proj_coords) / norm_emb
+
+    # Alias for backwards compatibility
+    cosine_to_subspace = cosine_to_anchor
+
     def match_image(self, image: Union[Image.Image, str]) -> float:
         """
-        Compute how well an image matches this anchor
-        
+        Compute how well an image matches this anchor.
+
         Args:
             image: PIL Image or image path
-        
+
         Returns:
-            float - distance to anchor subspace (lower = better match)
+            float in [0, 1] — cosine similarity to anchor subspace (higher = better match)
         """
         if isinstance(image, str):
             image = Image.open(image).convert('RGB')
-        
+
         embedding = self.embedder.embed_single(image)
-        return self.distance_to_subspace(embedding)
+        return self.cosine_to_anchor(embedding)
     
     def explained_variance_ratio(self) -> float:
-        """Fraction of total variance explained by anchor subspace"""
+        """Fraction of total variance explained by the top-r anchor subspace"""
         if self.eigenvalues is None:
             return 0.0
-        
-        # Need all eigenvalues to compute total variance
-        # For now, approximate as ratio of top-r to sum of top-100
-        # (proper version would need all d eigenvalues)
-        return self.eigenvalues.sum() / self.eigenvalues.sum()
+        return self.eigenvalues[:self.anchor_dim].sum() / self.eigenvalues.sum()
     
     @property
     def anchor_dim(self) -> int:
-        """Dimensionality of anchor subspace"""
-        return self.config.anchor_dim
+        """Number of eigenvectors used for projection (r)"""
+        return self._anchor_dim
+
+    @anchor_dim.setter
+    def anchor_dim(self, value: int):
+        if self.eigenvalues is not None and value > len(self.eigenvalues):
+            raise ValueError(
+                f"anchor_dim {value} exceeds available eigenvectors ({len(self.eigenvalues)})"
+            )
+        self._anchor_dim = value
     
     def save(self, path: str):
         """Save anchor to file"""
         data = {
             'config': asdict(self.config),
+            'anchor_dim': self._anchor_dim,
             'anchor_basis': self.anchor_basis,
             'eigenvalues': self.eigenvalues,
             'mean_embedding': self.mean_embedding,
@@ -291,12 +444,13 @@ class SymbolicAnchor:
         
         config = AnchorConfig(**data['config'])
         anchor = cls(config)
-        
+
         anchor.anchor_basis = data['anchor_basis']
         anchor.eigenvalues = data['eigenvalues']
         anchor.mean_embedding = data['mean_embedding']
         anchor.n_samples = data['n_samples']
         anchor.embedding_dim = data['embedding_dim']
+        anchor._anchor_dim = data.get('anchor_dim', config.anchor_dim)
         
         print(f"Anchor loaded from {path}")
         print(f"  Subspace: {anchor.anchor_dim}D in {anchor.embedding_dim}D")
@@ -310,33 +464,33 @@ class AnchorDatabase:
     """Manage multiple symbolic anchors for different objects"""
     
     def __init__(self):
-        self.anchors = {}  # object_id -> SymbolicAnchor
-    
-    def add_anchor(self, object_id: str, anchor: SymbolicAnchor):
+        self.anchors: Dict[str, Anchor] = {}
+
+    def add_anchor(self, object_id: str, anchor: Anchor):
         """Add anchor for an object"""
         self.anchors[object_id] = anchor
     
     def match_image(self, image: Union[Image.Image, str]) -> Dict[str, float]:
         """
-        Match image against all anchors
-        
+        Match image against all anchors.
+
         Returns:
-            dict mapping object_id -> distance
+            dict mapping object_id -> cosine similarity (higher = better match)
         """
-        distances = {}
+        similarities = {}
         for obj_id, anchor in self.anchors.items():
-            distances[obj_id] = anchor.match_image(image)
-        return distances
+            similarities[obj_id] = anchor.match_image(image)
+        return similarities
     
     def classify_image(self, image: Union[Image.Image, str]) -> str:
         """
-        Classify image to nearest anchor
-        
+        Classify image to best-matching anchor.
+
         Returns:
-            object_id of best matching anchor
+            object_id of best matching anchor (highest cosine similarity)
         """
-        distances = self.match_image(image)
-        return min(distances, key=distances.get)
+        similarities = self.match_image(image)
+        return max(similarities, key=similarities.get)
     
     def save(self, directory: str):
         """Save all anchors to directory"""

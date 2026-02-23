@@ -1,5 +1,5 @@
 # main.py
-from embeddings import DINOEmbedder
+from object.embeddings import DINOEmbedder
 from memory import VisualMemory
 from segmentation import simple_grid_segments
 from pathlib import Path
