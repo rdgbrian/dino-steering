@@ -49,7 +49,7 @@ print(f"Variance explained: {anchor.explained_variance_ratio():.2%}")
 
 # %%
 # Change r without re-running extraction
-anchor.anchor_dim = 5
+anchor.anchor_dim = 10
 print(f"r=10 variance explained: {anchor.explained_variance_ratio():.2%}")
 
 # %%
@@ -63,7 +63,10 @@ simple_anchor.extract_from_images([images[0]])
 
 # %%
 # Create original and blurred test image
+
+image_path = "lake\images\isaac\camera.png"
 test_img = images[0]
+# test_img = Image.open(image_path).convert('RGB')
 blur = GaussianBlur(radius_min=100, radius_max=100)  # fixed radius for reproducibility
 blurred_img = blur(test_img)
 
